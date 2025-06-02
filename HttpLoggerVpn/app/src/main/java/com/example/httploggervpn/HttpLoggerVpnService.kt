@@ -67,7 +67,9 @@ data class VpnSession(
     var clientSentFin: Boolean = false,
     var serverSentFin: Boolean = false,
     var vpnSentFinToClient: Boolean = false,
-    var vpnSentFinToServer: Boolean = false
+    var vpnSentFinToServer: Boolean = false,
+    var vpnFinToClientAckedByClient: Boolean = false,
+    var vpnFinToServerAckedByServer: Boolean = false
 ) {
     fun initializeSequenceNumbersAfterClientAckToOurSynAck(clientAckPacketSeqNum: Long) {
         vpnNextSeqToClient = vpnServerInitialSequenceNumber + 1
@@ -365,28 +367,45 @@ class HttpLoggerVpnService : VpnService() {
                 readBuffer.clear()
                 try {
                     val bytesRead = channel.read(readBuffer)
-                    if (bytesRead == -1) {
-                        Log.i("HttpLoggerVpnService", "EOF on server read for ${session.sessionKey} (Server FIN).")
+                    if (bytesRead == -1) { // Server sent FIN (EOF)
+                        Log.i("HttpLoggerVpnService", "EOF from server for ${session.sessionKey} (Server FIN).")
                         session.serverSentFin = true
-                        if (session.status == SessionStatus.ESTABLISHED || session.status == SessionStatus.SYN_ACK_SENT_TO_CLIENT) { // Or other relevant states
+                        key.interestOps(key.interestOps() and SelectionKey.OP_READ.inv()) // No more reading from server
+
+                        if (session.status == SessionStatus.ESTABLISHED) {
                             session.closingInitiator = "server"
-                            // TODO: sendFinAckToClient(session) in next step after buildIpTcpPacket is complete
-                            Log.d("HttpLoggerVpnService", "TODO: Call sendFinAckToClient for ${session.sessionKey}")
-                            session.status = SessionStatus.LAST_ACK_FROM_CLIENT
-                            key.interestOps(0) // No more reading, no more writing from our side yet.
-                        } else if (session.status == SessionStatus.CLIENT_FIN_RECEIVED) {
-                            Log.i("HttpLoggerVpnService", "Simultaneous FIN from server for ${session.sessionKey}.")
-                            // TODO: sendAckToClient for server's FIN if needed.
-                            session.status = SessionStatus.TIME_WAIT // Or directly to CLOSED
+                            sendTcpPacketToClient(session, (PacketUtil.TCP_FIN_FLAG or PacketUtil.TCP_ACK_FLAG).toByte(), ByteArray(0))
+                            // vpnSentFinToClient flag is set inside sendTcpPacketToClient if FIN is sent
+                            session.status = SessionStatus.SERVER_FIN_RECEIVED // We've sent FIN, waiting for client's ACK
+                        } else if (session.status == SessionStatus.CLIENT_FIN_RECEIVED) { // Client already sent FIN
+                            Log.i("HttpLoggerVpnService", "Server FIN received after client FIN for ${session.sessionKey} (simultaneous close).")
+                            // Client already processed our ACK for its FIN. We might have sent FIN+ACK to server.
+                            // Now server sends FIN. We should ACK this if not already done by previous FIN+ACK from us.
+                            // For simplicity here, assume previous FIN+ACK to server also acked any pending server data.
+                            // Our FIN to client was already sent when we processed client's FIN and server hadn't sent FIN yet.
+                            // Or if we sent FIN to client in SERVER_FIN_RECEIVED state.
+                            // This state implies both have initiated close, and we are likely waiting for final ACKs.
+                            // If client also ACKed our FIN, this session can be closed.
+                            // If client's FIN was acked, and now server's FIN is acked (implicitly by our FIN to client, or explicitly)
+                            session.status = SessionStatus.TIME_WAIT // Or CLOSED
                             closeSession(session, key)
+                        } else {
+                             Log.w("HttpLoggerVpnService", "Server FIN received in unexpected state ${session.status} for ${session.sessionKey}")
+                             // Potentially send RST to client and close.
+                             sendRstPacketToClient(session)
+                             closeSession(session, key, isRst = true)
                         }
+                        // Do not return, allow loop to continue for other keys or cleanup
                     } else if (bytesRead > 0) {
                         Log.d("HttpLoggerVpnService", "Read $bytesRead bytes from server ${session.sessionKey} (Data handling TODO)")
-                        // TODO: process data from server
+                        // TODO: process data from server, update sequence numbers, forward to client
+                        // session.vpnExpectedAckFromServer += bytesRead.toLong()
+                        // sendTcpPacketToClient(session, PacketUtil.TCP_ACK_FLAG or PacketUtil.TCP_PSH_FLAG, readPayload)
+                        // sendAckToServer(session, session.vpnExpectedAckFromServer) // Acknowledging server's data
                     }
-                } catch (e: IOException) {
-                     Log.e("HttpLoggerVpnService", "IOException on server read for ${session.sessionKey} (Server RST?). Closing.", e)
-                     sendRstPacketToClient(session) // Stubbed, will use real packet builder later
+                } catch (e: IOException) { // Likely RST from server or other connection error
+                     Log.e("HttpLoggerVpnService", "IOException on server read for ${session.sessionKey} (Server RST or conn error). Closing.", e)
+                     sendRstPacketToClient(session)
                      closeSession(session, key, isRst = true)
                 }
             }
@@ -521,9 +540,62 @@ class HttpLoggerVpnService : VpnService() {
         } catch (e: IOException) { Log.e("HttpLoggerVpnService", "finishConnect error: ${session.sessionKey}", e); closeSession(session, key, true) }
     }
 
-    private fun sendSynAckToClient(session: VpnSession): Boolean { /* ... */ return true} // Placeholder, assuming it exists and uses PacketUtil.buildIpTcpPacket
-    private fun sendRstPacketToClient(session: VpnSession) { Log.w("HttpLoggerVpnService", "RST to client for ${session.sessionKey} (STUB)")}
-    private fun sendRstPacketToServer(session: VpnSession) { Log.w("HttpLoggerVpnService", "RST to server for ${session.sessionKey} (STUB - closing channel)"); try {session.serverSocketChannel?.close()} catch(e:IOException){}}
+    private fun sendSynAckToClient(session: VpnSession): Boolean { // This should be correctly implemented from previous steps
+        val packet = PacketUtil.buildIpTcpPacket(
+            sourceIp = session.remoteIp, destinationIp = session.clientIp,
+            sourcePort = session.remotePort.toShort(), destinationPort = session.clientPort.toShort(),
+            sequenceNumber = session.vpnServerInitialSequenceNumber,
+            acknowledgementNumber = session.clientInitialSequenceNumber + 1,
+            tcpFlags = (PacketUtil.TCP_SYN_FLAG or PacketUtil.TCP_ACK_FLAG).toByte(),
+            windowSize = 65535.toShort(), payload = ByteArray(0)
+        )
+        try {
+            vpnOutputStream?.write(packet); vpnOutputStream?.flush()
+            Log.i("HttpLoggerVpnService", "SYN-ACK sent to client for ${session.sessionKey}")
+            // SYN consumes 1 byte of sequence number space
+            session.vpnNextSeqToClient = session.vpnServerInitialSequenceNumber + 1
+            return true
+        } catch (e: IOException) {
+            Log.e("HttpLoggerVpnService", "Failed to send SYN-ACK for ${session.sessionKey}", e)
+            return false
+        }
+    }
+
+    private fun sendRstPacketToClient(session: VpnSession) {
+        Log.i("HttpLoggerVpnService", "Sending RST to Client for session ${session.sessionKey}")
+        val seqForRst = session.vpnNextSeqToClient // Our current/next sequence number to client
+        // Ack number for RST can be the sequence number that caused the RST if known, otherwise 0 or current expected.
+        // For an unsolicited RST from us, session.vpnExpectedAckFromClient is appropriate.
+        val ackForRst = session.vpnExpectedAckFromClient
+
+        val rstPacket = PacketUtil.buildIpTcpPacket(
+            sourceIp = session.remoteIp,
+            destIp = session.clientIp,
+            sourcePort = session.remotePort.toShort(),
+            destPort = session.clientPort.toShort(),
+            sequenceNumber = seqForRst,
+            acknowledgementNumber = ackForRst, // Some stacks might expect this to be 0 for certain RSTs
+            tcpFlags = (PacketUtil.TCP_RST_FLAG or PacketUtil.TCP_ACK_FLAG).toByte(), // RST+ACK is common
+            windowSize = 0.toShort(), // Window size for RST is often 0
+            payload = ByteArray(0)
+        )
+        try {
+            vpnOutputStream?.write(rstPacket)
+            vpnOutputStream?.flush()
+            Log.i("HttpLoggerVpnService", "RST packet sent to client for ${session.sessionKey}")
+        } catch (e: IOException) {
+            Log.e("HttpLoggerVpnService", "Failed to send RST to client for ${session.sessionKey}", e)
+        }
+    }
+
+    private fun sendRstPacketToServer(session: VpnSession) {
+        Log.i("HttpLoggerVpnService", "Signaling server connection to close (will likely cause RST or FIN from OS) for session ${session.sessionKey}")
+        try {
+            session.serverSocketChannel?.close()
+        } catch (e: IOException) {
+            Log.w("HttpLoggerVpnService", "IOException while closing serverSocketChannel for ${session.sessionKey} during RST propagation.", e)
+        }
+    }
 
     // Generic helper to send a TCP packet to the client
     private fun sendTcpPacketToClient(session: VpnSession, flags: Byte, payload: ByteArray) {

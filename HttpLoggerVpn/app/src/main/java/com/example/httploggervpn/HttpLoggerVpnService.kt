@@ -7,6 +7,7 @@ import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.util.Log // 临时用于日志
 import com.example.httploggervpn.R // 用于 R.string.app_name
+import android.content.pm.PackageManager // Required for NameNotFoundException
 import java.io.FileInputStream // 现在需要
 import java.io.FileOutputStream // 虽然没用上，但保持导入为后续可能扩展
 import java.io.IOException // For try-catch block in worker thread
@@ -86,15 +87,24 @@ class HttpLoggerVpnService : VpnService() {
         if (prepare(this) == null) {
             // 权限已授予或不需要
             vpnInterface = Builder()
-                .setSession(getString(R.string.app_name)) // 需要在 strings.xml 中定义 app_name
+                .setSession(getString(R.string.app_name))
                 .addAddress("10.0.0.2", 24) // 虚拟 IP 地址
-                .addRoute("0.0.0.0", 0)    // 捕获所有 IPv4 流量
+                // .addRoute("0.0.0.0", 0)    // 移除或注释掉此行：捕获所有 IPv4 流量
                 // .addDnsServer("8.8.8.8") // 可选的 DNS 服务器
+                .apply {
+                    try {
+                        addAllowedApplication("mark.via")
+                        Log.i("HttpLoggerVpnService", "Successfully added mark.via to allowed applications.")
+                    } catch (e: PackageManager.NameNotFoundException) {
+                        Log.e("HttpLoggerVpnService", "Allowed application 'mark.via' not found.", e)
+                        // Builder会内部处理这个异常，establish() 可能会返回 null
+                        // 我们在这里记录，以便调试
+                    }
+                }
                 .establish()
 
             if (vpnInterface == null) {
-                // 连接建立失败，可能的原因包括权限问题或配置错误
-                Log.e("HttpLoggerVpnService", "Failed to establish VPN interface.")
+                Log.e("HttpLoggerVpnService", "Failed to establish VPN interface. If an allowed application was specified, ensure it is installed and the package name is correct.")
                 stopSelf() // 停止服务
                 return
             }
